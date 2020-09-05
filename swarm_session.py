@@ -1,16 +1,28 @@
+import os
+os.environ["TF_CPP_MIN_VLOG_LEVEL"] = "0"
+
 import secrets
-import tensorflow as tf
 from cloud_tpu_client import Client
 import tpunicorn
 from multiprocessing.pool import ThreadPool
-import os
-import psutil
+import logging
 
+import psutil
+from mock import patch
+from tpu_system_metadata import _query_tpu_system_metadata as _query_tpu_system_metadata_patched
+
+patcher = patch('tensorflow.python.tpu.tpu_system_metadata._query_tpu_system_metadata', _query_tpu_system_metadata_patched)
+patcher.start()
+
+import tensorflow as tf
+tf.debugging.set_log_device_placement(True)
+tf.get_logger().setLevel(logging.INFO)
 
 class SwarmSession():
     def __init__(self, name_prefix="swarm", tpu_version=tf.__version__, api_threads=8):
         self.tpus = []
-        self.tpu_resolvers = []
+        self.tpu_resolvers = {}
+        self.strategies = {}
         self.topologies = {}
         self.name_prefix = name_prefix
         self.total_tpu_count = 0
@@ -18,10 +30,16 @@ class SwarmSession():
         self.pool = ThreadPool(api_threads)
 
     # reconnect to TPUs which match the name prefix
-    def reconnect_tpus(self):
+    def reconnect_tpus(self, max_tpus=None):
         connect_tpus = [tpu["name"].split("/")[-1] for tpu in tpunicorn.get_tpus() if tpu["name"].split("/")[-1].startswith(self.name_prefix)]
 
-        self.pool.map(self.connect_tpu, connect_tpus)
+        # self.pool.map(self.connect_tpu, connect_tpus)
+
+        if max_tpus is not None:
+            connect_tpus = connect_tpus[:max_tpus]
+
+        for tpu in connect_tpus:
+            self.connect_tpu(tpu)
 
     def connect_tpu(self, tpu_name):
         self.tpus.append(tpu_name)
@@ -32,11 +50,15 @@ class SwarmSession():
         c.wait_for_healthy(interval=5)
 
         tpu_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=tpu_name, job_name=tpu_name)
-        self.tpu_resolvers.append(tpu_resolver)
+        self.tpu_resolvers[tpu_name] = tpu_resolver
 
-        # TODO: might want to check health of nodes in self.tpus before redefining the cluster
-        tf.config.experimental_connect_to_cluster(tf.distribute.cluster_resolver.UnionResolver(*self.tpu_resolvers))
+        if len(self.tpu_resolvers) == 1:
+            tf.config.experimental_connect_to_cluster(tpu_resolver)
+        else:
+            # TODO: might want to check health of nodes in self.tpus before redefining the cluster
+            tf.config.experimental_connect_to_cluster(tf.distribute.cluster_resolver.UnionResolver(*self.tpu_resolvers.values()))
         topology = tf.tpu.experimental.initialize_tpu_system(tpu_resolver)
+        self.strategies[tpu_name] = tf.distribute.TPUStrategy(tpu_resolver)
 
         self.topologies[tpu_name] = topology
         self.total_tpu_count = len(self.tpus)
@@ -50,16 +72,18 @@ class SwarmSession():
             new_tpus.append(name)
             self.total_tpu_count += 1
 
-            commands.append(f"gcloud compute tpus create {name} --zone {zone} --project {project} --version 1.15.2 --accelerator-type {accelerator_type}")
+            commands.append(f"gcloud compute tpus create {name} --zone {zone} --project {project} --version 1.15.2 --accelerator-type {accelerator_type} --quiet")
 
         print(f"creating TPUs {new_tpus}")
         self.pool.map(os.system, commands)
         print(f"connecting to TPUs {new_tpus}")
-        self.pool.map(self.connect_tpu, new_tpus)
+        # self.pool.map(self.connect_tpu, new_tpus)
+        for tpu in new_tpus:
+            self.connect_tpu(tpu)
         print(f"connected to TPUs {new_tpus}")
 
     def reconnect_and_create(self, max_tpus, zone="europe-west4-a", accelerator_type="v3-8", project="youdreamof-1543654322305"):
-        self.reconnect_tpus()
+        self.reconnect_tpus(max_tpus)
         print(f"reconnected to TPUs {self.tpus}")
         print(f"creating {max_tpus - self.total_tpu_count} more TPUs")
         self.create_tpu(max_tpus - self.total_tpu_count, zone, accelerator_type, project)
